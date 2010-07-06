@@ -117,7 +117,7 @@ class Papercut_Storage:
         num_rows = self.cursor.execute(stmt)
         ids = list(self.cursor.fetchall())
         for id in ids:
-            articles.append("<%s@%s>" % (id, group)) # TODO
+            articles.append(self.get_message_id(id, group))
         if len(articles) == 0:
             return ''
         else:
@@ -179,11 +179,11 @@ class Papercut_Storage:
             headers.append("Newsgroups: %s" % (group_name))
             headers.append("Date: %s" % (formatted_time))
             headers.append("Subject: %s" % (result[3]))
-            headers.append("Message-ID: <%s@%s>" % (result[0], group_name)) # TODO
+            headers.append("Message-ID: " + self.get_message_id(result[0], group_name))
             headers.append("Xref: %s %s:%s" % (settings.nntp_hostname, group_name, result[0]))
             if result[6] != 0:
-                headers.append("References: <%s@%s>" % (result[6], group_name))
-                headers.append("In-Reply-To: <%s@%s>" % (result[6], group_name))
+                headers.append("References: " + self.get_message_id(result[6], group_name))
+                headers.append("In-Reply-To: " + self.get_message_id(result[6], group_name))
         if headers_only:
             return "\r\n".join(headers)
         if body_only:
@@ -261,11 +261,11 @@ class Papercut_Storage:
             else:
                 author = "%s <%s>" % (row[2], row[3])
             formatted_time = strutil.get_formatted_time(time.localtime(row[5]))
-            message_id = "<%s@%s>" % (row[0], group_name)
+            message_id = self.get_message_id(row[0], group_name)
             line_count = len(row[6].split('\n'))
             xref = 'Xref: %s %s:%s' % (settings.nntp_hostname, group_name, row[0])
             if row[1] != 0:
-                reference = "<%s@%s>" % (row[1], group_name) # TODO
+                reference = self.get_message_id(row[1], group_name)
             else:
                 reference = ""
             # message_number <tab> subject <tab> author <tab> date <tab> message_id <tab> reference <tab> bytes <tab> lines <tab> xref
@@ -309,9 +309,9 @@ class Papercut_Storage:
             elif header.upper() == 'DATE':
                 hdrs.append('%s %s' % (row[0], strutil.get_formatted_time(time.localtime(result[5]))))
             elif header.upper() == 'MESSAGE-ID':
-                hdrs.append('%s <%s@%s>' % (row[0], row[0], group_name)) # TODO
+                hdrs.append(row[0] + ' ' + self.get_message_id(row[0], group_name))
             elif (header.upper() == 'REFERENCES') and (row[1] != 0):
-                hdrs.append('%s <%s@%s>' % (row[0], row[1], group_name))
+                hdrs.append(row[0] + ' ' + self.message_id(row[1], group_name))
             elif header.upper() == 'BYTES':
                 hdrs.append('%s %s' % (row[0], len(row[6])))
             elif header.upper() == 'LINES':
@@ -376,9 +376,9 @@ class Papercut_Storage:
             elif header.upper() == 'DATE':
                 hdrs.append('%s %s' % (row[0], strutil.get_formatted_time(time.localtime(result[5]))))
             elif header.upper() == 'MESSAGE-ID':
-                hdrs.append('%s <%s@%s>' % (row[0], row[0], group_name)) # TODO
+                hdrs.append(row[0] + ' ' + self.get_message_id(row[0], group_name))
             elif (header.upper() == 'REFERENCES') and (row[1] != 0):
-                hdrs.append('%s <%s@%s>' % (row[0], row[1], group_name))
+                hdrs.append(row[0] + ' ' + self.get_message_id(row[1], group_name))
             elif header.upper() == 'BYTES':
                 hdrs.append('%s %s' % (row[0], len(row[6])))
             elif header.upper() == 'LINES':
