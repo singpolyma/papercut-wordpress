@@ -1,0 +1,8 @@
+A storage backend for the papercut NNTP server that reads/writes a Wordpres
+database.
+
+Just place wordpress.py in your papercut storage modules directory,
+/usr/share/papercut/storage on my system, and then set
+storage_backend = 'wordpress' and dbhost, dbname, dbuser, dbpass
+
+Papercut: <http://pessoal.org/papercut/>
