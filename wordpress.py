@@ -30,7 +30,7 @@ class Papercut_Storage:
     """
 
     def __init__(self):
-        self.conn = MySQLdb.connect(host=settings.dbhost, db=settings.dbname, user=settings.dbuser, passwd=settings.dbpass)
+        self.conn = MySQLdb.connect(host=settings.dbhost, db=settings.dbname, user=settings.dbuser, passwd=settings.dbpass, charset='utf8', use_unicode=True)
         self.cursor = self.conn.cursor()
 
     def get_message_body(self, headers):
