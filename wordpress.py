@@ -10,6 +10,11 @@ import mime
 import strutil
 import os.path
 
+try:
+    import html2text
+except ImportError:
+    html2text = None # Optional, GPL
+
 # patch by Andreas Wegmann <Andreas.Wegmann@VSA.de> to fix the handling of unusual encodings of messages
 q_quote_multiline = re.compile("=\?(.*?)\?[qQ]\?(.*?)\?=.*?=\?\\1\?[qQ]\?(.*?)\?=", re.M | re.S)
 # we don't need to compile the regexps everytime..
@@ -19,6 +24,9 @@ from_regexp = re.compile("^From:(.*)<(.*)>", re.M)
 subject_regexp = re.compile("^Subject:(.*)", re.M)
 references_regexp = re.compile("^References:(.*)<(.*)>", re.M)
 lines_regexp = re.compile("^Lines:(.*)", re.M)
+
+# How much comment IDs are ahead
+COMMENT_AHEAD=1000000
 
 class Papercut_Storage:
     """
@@ -64,7 +72,26 @@ class Papercut_Storage:
         else:
             stmt = "%s AND ID = %s" % (stmt, range[0])
         self.cursor.execute(stmt)
-        return self.cursor.fetchone()[0]
+        post_count = self.cursor.fetchone()[0]
+        if post_count < 1:
+            stmt = """
+                    SELECT
+                        COUNT(*) AS total
+                    FROM
+                        wp_comments,
+                        wp_posts
+                    WHERE
+                        comment_post_ID=wp_posts.ID AND
+                        post_type='post' AND post_status='publish'"""
+            if style == 'range':
+                stmt = "%s AND comment_ID > %s" % (stmt, self.get_comment_id(range[0]))
+                if len(range) == 2:
+                    stmt = "%s AND comment_ID < %s" % (stmt, self.get_comment_id(range[1]))
+            else:
+                stmt = "%s AND comment_ID = %s" % (stmt, self.get_comment_id(range[0]))
+            self.cursor.execute(stmt)
+            return self.cursor.fetchone()[0]
+        return post_count
 
     def get_first_article(self, group_name):
         table_name = self.get_table_name(group_name)
@@ -90,14 +117,77 @@ class Papercut_Storage:
                 WHERE
                     post_type='post' AND post_status='publish'""" % (table_name)
         num_rows = self.cursor.execute(stmt)
-        total, max, min = self.cursor.fetchone()
-        return (total, min, max, group_name)
+        total, maxi, min = self.cursor.fetchone()
+        stmt = """
+                SELECT
+                   COUNT(comment_ID) AS total,
+                   IF(MAX(comment_ID) IS NULL, 0, MAX(comment_ID))+%s AS maximum
+                FROM
+                    wp_comments,
+                    wp_posts
+                WHERE
+                    comment_post_ID=wp_posts.ID AND
+                    comment_approved='1' AND
+                    post_type='post' AND post_status='publish'
+                LIMIT 0, 1""" % (COMMENT_AHEAD,)
+        num_rows = self.cursor.execute(stmt)
+        totalc, maxc = self.cursor.fetchone()
+        return (total+totalc, min, max(maxi,maxc), group_name)
 
     def get_table_name(self, group_name):
         return 'wp_posts' # TODO
 
     def get_message_id(self, msg_num, group):
-        return '<%s@%s>' % (msg_num, group) # TODO
+        cid = self.get_comment_id(msg_num)
+        if cid:
+            return '<comment-%s@%s.%s>' % (cid, group, settings.nntp_hostname)
+        return '<%s@%s.%s>' % (msg_num, group, settings.nntp_hostname)
+
+    def get_comment_id(self, msg_num):
+        """ Need numeric IDs for everything. Treat comments as COMMENT_AHEAD ahead. """
+        msg_num = int(msg_num)
+        if msg_num >= COMMENT_AHEAD:
+            return int(msg_num - COMMENT_AHEAD)
+        return None
+
+    def get_article_sql(self, msg_num):
+        stmt = """
+                SELECT
+                    A.ID,
+                    display_name,
+                    user_email,
+                    post_title,
+                    UNIX_TIMESTAMP(post_date_gmt) AS datestamp,
+                    post_content,
+                    post_parent
+                FROM
+                    %s A,
+                    wp_users
+                WHERE
+                    A.post_type='post' AND A.post_status='publish' AND
+                    A.post_author=wp_users.ID AND"""
+        cid = self.get_comment_id(msg_num)
+        if cid: # If it's a comment, different table/sql
+            table_name = 'wp_comments' # TODO
+            stmt = """
+                   SELECT
+                       A.comment_ID+%s as ID,
+                       IF(user_id = 0, comment_author, display_name) as display_name,
+                       IF(user_id = 0, comment_author_email, user_email) as user_email,
+                       CONCAT('Re: ', post_title) as post_title,
+                       UNIX_TIMESTAMP(comment_date_gmt) AS datestamp,
+                       comment_content AS post_content,
+                       IF(comment_parent = 0, comment_post_ID, comment_parent) as post_parent
+                   FROM
+                       wp_comments A LEFT OUTER JOIN
+                       wp_users ON user_id=wp_users.ID,
+                       %s
+                   WHERE
+                       comment_post_ID=wp_posts.ID AND
+                       comment_approved='1' AND
+                       wp_posts.post_type='post' AND wp_posts.post_status='publish' AND
+                   """ % (COMMENT_AHEAD, '%s')
+        return stmt
 
     def get_NEWGROUPS(self, ts, group='%'):
         return None # TODO
@@ -147,22 +237,12 @@ class Papercut_Storage:
 
     def get_ARTICLE(self, group_name, id, headers_only=False, body_only=False):
         table_name = self.get_table_name(group_name)
-        stmt = """
-                SELECT
-                    A.ID,
-                    display_name,
-                    user_email,
-                    post_title,
-                    UNIX_TIMESTAMP(post_date_gmt) AS datestamp,
-                    post_content,
-                    post_parent
-                FROM
-                    %s A,
-                    wp_users
-                WHERE
-                    A.post_type='post' AND A.post_status='publish' AND
-                    A.post_author=wp_users.ID AND
-                    A.ID=%s""" % (table_name, id)
+        stmt = self.get_article_sql(id) % (table_name,)
+        cid = self.get_comment_id(id)
+        if cid:
+            stmt += ' A.comment_ID=%s' % (cid,)
+        else:
+            stmt += ' A.ID=%s' % (id,)
         num_rows = self.cursor.execute(stmt)
         if num_rows == 0:
             return None
@@ -184,25 +264,47 @@ class Papercut_Storage:
             if result[6] != 0:
                 headers.append("References: " + self.get_message_id(result[6], group_name))
                 headers.append("In-Reply-To: " + self.get_message_id(result[6], group_name))
+            headers.append('Content-Type: text/plain; charset=utf-8')
         if headers_only:
             return "\r\n".join(headers)
+        if html2text:
+            body = html2text.html2text(result[5].encode('utf-8')).encode('utf-8')
+        else:
+            body = strutil.format_body(result[5].encode('utf-8'))
         if body_only:
-            return strutil.format_body(result[5])
-        return ("\r\n".join(headers), strutil.format_body(result[5]))
+            return body
+        return ("\r\n".join(headers), body)
 
     def get_LAST(self, group_name, current_id):
-        table_name = self.get_table_name(group_name)
-        stmt = """
-                SELECT
-                    ID
-                FROM
-                    %s
-                WHERE
-                    post_type='post' AND post_status='publish' AND
-                    ID < %s
-                ORDER BY
-                    ID DESC
-                LIMIT 0, 1""" % (table_name, current_id)
+        if int(current_id) > COMMENT_AHEAD:
+            table_name = 'wp_comments' # TODO
+            stmt = """
+                    SELECT
+                        comment_ID+%s as ID
+                    FROM
+                        %s,
+                        wp_posts
+                    WHERE
+                        comment_post_ID=wp_posts.ID AND
+                        post_type='post' AND post_status='publish' AND
+                        comment_approved='1' AND
+                        ID < %s
+                    ORDER BY
+                        ID DESC
+                    LIMIT 0, 1""" % (COMMENT_AHEAD, table_name, self.get_comment_id(current_id))
+        else:
+            table_name = self.get_table_name(group_name)
+            stmt = """
+                    SELECT
+                        ID
+                    FROM
+                        %s
+                    WHERE
+                        post_type='post' AND post_status='publish' AND
+                        ID < %s
+                    ORDER BY
+                        ID DESC
+                    LIMIT 0, 1""" % (table_name, current_id)
         num_rows = self.cursor.execute(stmt)
         if num_rows == 0:
             return None
@@ -222,8 +324,26 @@ class Papercut_Storage:
                     ID ASC
                 LIMIT 0, 1""" % (table_name, current_id)
         num_rows = self.cursor.execute(stmt)
-        if num_rows == 0:
-            return None
+        if num_rows == 0: # If no next post, try next as comment
+            cid = self.get_comment_id(current_id)
+            table_name = 'wp_comments'
+            stmt = """
+                    SELECT
+                        comment_ID+%s as ID
+                    FROM
+                        %s,
+                        wp_posts
+                    WHERE
+                        comment_post_ID=wp_posts.ID AND
+                        post_type='post' AND post_status='publish' AND
+                        comment_approved='1' AND
+                        ID > %s
+                    ORDER BY
+                        ID ASC
+                    LIMIT 0, 1""" % (COMMENT_AHEAD, table_name, cid and cid or 0)
+            num_rows = self.cursor.execute(stmt)
+            if num_rows == 0:
+                return None
         return self.cursor.fetchone()[0]
 
     def get_HEAD(self, group_name, id):
@@ -234,48 +354,47 @@ class Papercut_Storage:
 
     def get_XOVER(self, group_name, start_id, end_id='ggg'):
         table_name = self.get_table_name(group_name)
-        stmt = """
-                SELECT
-                    A.ID,
-                    post_parent,
-                    display_name,
-                    user_email,
-                    post_title,
-                    UNIX_TIMESTAMP(post_date_gmt) AS datestamp,
-                    post_content
-                FROM
-                    %s A, 
-                    wp_users
-                WHERE
-                    A.post_type='post' AND A.post_status='publish' AND
-                    A.post_author=wp_users.ID AND
-                    A.ID >= %s""" % (table_name, start_id)
+        # TODO: range that crosses over posts and comments will NOT WORK
+        stmt = self.get_article_sql(start_id) % (table_name,)
+        cid = self.get_comment_id(start_id)
+        if cid:
+            id_field = 'comment_ID'
+            stmt += ' comment_ID >= %s' % (cid,)
+            end_id = self.get_comment_id(end_id)
+        else:
+            id_field = 'ID'
+            stmt += ' A.ID >= %s' % (start_id,)
         if end_id != 'ggg':
-            stmt = "%s AND A.ID <= %s" % (stmt, end_id)
+            stmt = "%s AND A.%s <= %s" % (stmt, id_field, end_id)
         self.cursor.execute(stmt)
         result = list(self.cursor.fetchall())
         overviews = []
         for row in result:
-            if row[3] == '':
-                author = row[2]
+            if html2text:
+                body = html2text.html2text(row[5].encode('utf-8')).encode('utf-8')
             else:
-                author = "%s <%s>" % (row[2], row[3])
-            formatted_time = strutil.get_formatted_time(time.localtime(row[5]))
+                body = strutil.format_body(row[5].encode('utf-8'))
+            if row[2] == '':
+                author = row[1]
+            else:
+                author = "%s <%s>" % (row[1], row[2])
+            formatted_time = strutil.get_formatted_time(time.localtime(row[4]))
             message_id = self.get_message_id(row[0], group_name)
-            line_count = len(row[6].split('\n'))
+            line_count = body.count("\n")
             xref = 'Xref: %s %s:%s' % (settings.nntp_hostname, group_name, row[0])
-            if row[1] != 0:
-                reference = self.get_message_id(row[1], group_name)
+            if row[6] != 0:
+                reference = self.get_message_id(row[6], group_name)
             else:
                 reference = ""
             # message_number <tab> subject <tab> author <tab> date <tab> message_id <tab> reference <tab> bytes <tab> lines <tab> xref
-            overviews.append("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (row[0], row[4], author, formatted_time, message_id, reference, len(strutil.format_body(row[6])), line_count, xref))
+            overviews.append("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (row[0], row[3], author, formatted_time, message_id, reference, len(body), line_count, xref))
         return "\r\n".join(overviews)
 
     def get_XPAT(self, group_name, header, pattern, start_id, end_id='ggg'):
         # XXX: need to actually check for the header values being passed as
         # XXX: not all header names map to column names on the tables
         table_name = self.get_table_name(group_name)
+        # TODO: support comments as well
         stmt = """
                 SELECT
                     A.ID,
@@ -326,14 +445,25 @@ class Papercut_Storage:
     def get_LISTGROUP(self, group_name):
         table_name = self.get_table_name(group_name)
         stmt = """
-                SELECT
+                (SELECT
                     ID
                 FROM
                     %s
                 WHERE
                     post_type='post' AND post_status='publish'
+                ) UNION (
+                SELECT
+                    comment_ID+%s as ID
+                FROM
+                    wp_comments,
+                    wp_posts
+                WHERE
+                    comment_post_ID=wp_posts.ID AND
+                    post_type='post' AND post_status='publish' AND
+                    comment_approved = '1'
+                )
                 ORDER BY
-                    id ASC""" % (table_name)
+                    ID ASC""" % (table_name, COMMENT_AHEAD)
         self.cursor.execute(stmt)
         result = list(self.cursor.fetchall())
         return "\r\n".join(["%s" % k for k in result])
@@ -343,32 +473,25 @@ class Papercut_Storage:
 
     def get_XHDR(self, group_name, header, style, range):
         table_name = self.get_table_name(group_name)
-        stmt = """
-                SELECT
-                    A.ID,
-                    post_parent,
-                    display_name,
-                    user_email,
-                    post_title,
-                    UNIX_TIMESTAMP(post_date_gmt) AS datestamp,
-                    post_content
-                FROM
-                    %s A,
-                    wp_users
-                WHERE
-                    A.post_type='post' AND A.post_status='publish' AND
-                    post_author = wp_users.ID AND """ % (table_name)
+        # TODO: range that crosses over posts and comments will NOT WORK
+        stmt = self.get_article_sql(range[0]) % (table_name,)
+        id_field = 'ID'
+        cid = self.get_comment_id(range[0])
+        if cid:
+            id_field = 'comment_ID'
         if style == 'range':
-            stmt = '%s A.id >= %s' % (stmt, range[0])
+            stmt = '%s A.%s >= %s' % (stmt, id_field, cid and cid or range[0])
             if len(range) == 2:
-                stmt = '%s AND A.id <= %s' % (stmt, range[1])
+                stmt = '%s AND A.%s <= %s' % (stmt, id_field, cid and range[1]-COMMENT_AHEAD or range[1])
         else:
-            stmt = '%s A.id = %s' % (stmt, range[0])
+            stmt = '%s A.%s = %s' % (stmt, id_field, cid and cid or range[0])
         if self.cursor.execute(stmt) == 0:
             return None
         result = self.cursor.fetchall()
         hdrs = []
         for row in result:
+            row = list(row)
+            row.insert(0, row.pop()) # Shove post_parent on the front
             if header.upper() == 'SUBJECT':
                 hdrs.append('%s %s' % (row[0], row[4]))
             elif header.upper() == 'FROM':
