@@ -25,9 +25,6 @@ subject_regexp = re.compile("^Subject:(.*)", re.M)
 references_regexp = re.compile("^References:(.*)<(.*)>", re.M)
 lines_regexp = re.compile("^Lines:(.*)", re.M)
 
-# How much comment IDs are ahead
-COMMENT_AHEAD=1000000
-
 class Papercut_Storage:
     """
     Storage Backend interface for the Wordpress blog software
@@ -40,6 +37,14 @@ class Papercut_Storage:
     def __init__(self):
         self.conn = MySQLdb.connect(host=settings.dbhost, db=settings.dbname, user=settings.dbuser, passwd=settings.dbpass, charset='utf8', use_unicode=True)
         self.cursor = self.conn.cursor()
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS wp_newsgroup_meta(
+                               article_number BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                               message_id CHAR(255) UNIQUE NOT NULL,
+                               id BIGINT NOT NULL, tbl CHAR(50), newsgroup CHAR(255),
+                               CONSTRAINT UNIQUE INDEX id_table (id, tbl),
+                               INDEX newsgroup (newsgroup)
+                               )""")
+        self.update_newsgroup_meta()
 
     def get_message_body(self, headers):
         """Parses and returns the most appropriate message body possible.
@@ -56,162 +61,190 @@ class Papercut_Storage:
     def group_exists(self, group_name):
         return (group_name == 'blog.singpolyma') # TODO
 
+    def update_newsgroup_meta(self):
+        group = 'blog.singpolyma' # TODO
+        meta_table = self.get_table_name(table_name='newsgroup_meta')
+        posts_table = self.get_table_name(table_name='posts')
+        comments_table = self.get_table_name(table_name='comments')
+        stmt = """ INSERT INTO wp_newsgroup_meta (id, tbl, message_id, newsgroup)
+                   SELECT ID, tbl, message_id, '%s' FROM (
+                   (SELECT
+                       a.ID, 'wp_posts' AS tbl,
+                       CONCAT('<post-', a.ID, '@%s>') AS message_id,
+                       post_date_gmt AS datestamp
+                   FROM
+                       wp_posts a LEFT JOIN wp_newsgroup_meta b ON a.ID=b.id AND b.tbl='wp_posts'
+                   WHERE
+                       isNULL(b.id) AND post_type='post' AND post_status='publish'
+                   ) UNION (
+                   SELECT
+                       comment_ID as ID, 'wp_comments' AS tbl,
+                       CONCAT('<comment-', comment_ID, '@%s>') AS message_id,
+                       comment_date_gmt AS datestamp
+                   FROM
+                       wp_posts c, wp_comments a LEFT JOIN wp_newsgroup_meta b ON comment_ID=b.id AND b.tbl='wp_comments'
+                   WHERE
+                       a.comment_post_ID=c.ID AND
+                       isNULL(b.id) AND comment_approved='1' AND
+                       post_type='post' AND post_status='publish'
+                   )
+                   ORDER BY datestamp) t
+               """.replace('wp_posts', posts_table).replace('wp_comments', comments_table).replace('wp_newsgroup_meta', meta_table) % (group, settings.nntp_hostname, settings.nntp_hostname)
+        self.cursor.execute(stmt)
+
     def article_exists(self, group_name, style, range):
-        table_name = self.get_table_name(group_name)
+        self.update_newsgroup_meta()
+        table_name = self.get_table_name(table_name='newsgroup_meta')
         stmt = """
                 SELECT
                     COUNT(*) AS total
                 FROM
                     %s
                 WHERE
-                    post_type='post' AND post_status='publish'""" % (table_name)
+                    newsgroup='%s' AND """ % (table_name, group_name)
         if style == 'range':
-            stmt = "%s AND ID > %s" % (stmt, range[0])
+            stmt = "%s AND article_number > %s" % (stmt, range[0])
             if len(range) == 2:
-                stmt = "%s AND ID < %s" % (stmt, range[1])
+                stmt = "%s AND article_number < %s" % (stmt, range[1])
         else:
-            stmt = "%s AND ID = %s" % (stmt, range[0])
+            stmt = "%s AND article_number = %s" % (stmt, range[0])
         self.cursor.execute(stmt)
-        post_count = self.cursor.fetchone()[0]
-        if post_count < 1:
-            stmt = """
-                    SELECT
-                        COUNT(*) AS total
-                    FROM
-                        wp_comments,
-                        wp_posts
-                    WHERE
-                        comment_post_ID=wp_posts.ID AND
-                        post_type='post' AND post_status='publish'"""
-            if style == 'range':
-                stmt = "%s AND comment_ID > %s" % (stmt, self.get_comment_id(range[0]))
-                if len(range) == 2:
-                    stmt = "%s AND comment_ID < %s" % (stmt, self.get_comment_id(range[1]))
-            else:
-                stmt = "%s AND comment_ID = %s" % (stmt, self.get_comment_id(range[0]))
-            self.cursor.execute(stmt)
-            return self.cursor.fetchone()[0]
-        return post_count
+        return self.cursor.fetchone()[0]
 
     def get_first_article(self, group_name):
-        table_name = self.get_table_name(group_name)
+        self.update_newsgroup_meta()
+        table_name = self.get_table_name(table_name='newsgroup_meta')
         stmt = """
                 SELECT
-                    IF(MIN(ID) IS NULL, 0, MIN(ID)) AS first_article
+                    IF(MIN(message_num) IS NULL, 0, MIN(message_num)) AS first_article
                 FROM
                     %s
                 WHERE
-                   post_type='post' AND post_status='publish'""" % (table_name)
+                   newsgroup='%s'""" % (table_name, group_name)
         num_rows = self.cursor.execute(stmt)
         return self.cursor.fetchone()[0]
 
     def get_group_stats(self, group_name):
-        table_name = self.get_table_name(group_name)
+        self.update_newsgroup_meta()
+        table_name = self.get_table_name(table_name='newsgroup_meta')
         stmt = """
                 SELECT
-                   COUNT(ID) AS total,
-                   IF(MAX(ID) IS NULL, 0, MAX(ID)) AS maximum,
-                   IF(MIN(ID) IS NULL, 0, MIN(ID)) AS minimum
+                   COUNT(article_number) AS total,
+                   IF(MAX(article_number) IS NULL, 0, MAX(article_number)) AS maximum,
+                   IF(MIN(article_number) IS NULL, 0, MIN(article_number)) AS minimum
                 FROM
                     %s
                 WHERE
-                    post_type='post' AND post_status='publish'""" % (table_name)
-        num_rows = self.cursor.execute(stmt)
-        total, maxi, min = self.cursor.fetchone()
+                    newsgroup='%s'""" % (table_name, group_name)
+        self.cursor.execute(stmt)
+        total, maxi, mini = self.cursor.fetchone()
+        return (total, mini, maxi, group_name)
+
+    def get_table_name(self, group_name=None, table_name=None):
+        if not table_name:
+            table_name = 'posts'
+        return 'wp_' + table_name # TODO
+
+    def get_message_id(self, msg_num, group, table=None):
+        table_name = self.get_table_name(table_name='newsgroup_meta')
+        compar = table and 'id' or 'article_number'
         stmt = """
-                SELECT
-                   COUNT(comment_ID) AS total,
-                   IF(MAX(comment_ID) IS NULL, 0, MAX(comment_ID))+%s AS maximum
-                FROM
-                    wp_comments,
-                    wp_posts
-                WHERE
-                    comment_post_ID=wp_posts.ID AND
-                    comment_approved='1' AND
-                    post_type='post' AND post_status='publish'
-                LIMIT 0, 1""" % (COMMENT_AHEAD,)
-        num_rows = self.cursor.execute(stmt)
-        totalc, maxc = self.cursor.fetchone()
-        return (total+totalc, min, max(maxi,maxc), group_name)
+               SELECT
+                   message_id
+               FROM
+                   %s
+               WHERE
+                   newsgroup='%s' AND %s=%s
+               """ % (table_name, group, compar, int(msg_num))
+        if table:
+            stmt += " AND tbl='%s'" % self.get_table_name(table_name=table)
+        self.cursor.execute(stmt)
+        return self.cursor.fetchone()[0]
 
-    def get_table_name(self, group_name):
-        return 'wp_posts' # TODO
-
-    def get_message_id(self, msg_num, group):
-        cid = self.get_comment_id(msg_num)
-        if cid:
-            return '<comment-%s@%s.%s>' % (cid, group, settings.nntp_hostname)
-        return '<%s@%s.%s>' % (msg_num, group, settings.nntp_hostname)
-
-    def get_comment_id(self, msg_num):
-        """ Need numeric IDs for everything. Treat comments as COMMENT_AHEAD ahead. """
-        msg_num = int(msg_num)
-        if msg_num >= COMMENT_AHEAD:
-            return int(msg_num - COMMENT_AHEAD)
-        return None
-
-    def get_article_sql(self, msg_num):
+    def get_article_sql(self):
+        meta_table = self.get_table_name(table_name='newsgroup_meta')
+        posts_table = self.get_table_name(table_name='posts')
+        comments_table = self.get_table_name(table_name='comments')
         stmt = """
-                SELECT
-                    A.ID,
+                SELECT M.article_number,S.*,M.message_id FROM (
+                (SELECT
+                    A.ID as ID,
                     display_name,
                     user_email,
                     post_title,
                     UNIX_TIMESTAMP(post_date_gmt) AS datestamp,
                     post_content,
-                    post_parent
+                    post_parent,
+                    0 AS comment_parent
                 FROM
-                    %s A,
+                    wp_posts A,
                     wp_users
                 WHERE
                     A.post_type='post' AND A.post_status='publish' AND
-                    A.post_author=wp_users.ID AND"""
-        cid = self.get_comment_id(msg_num)
-        if cid: # If it's a comment, different table/sql
-            table_name = 'wp_comments' # TODO
-            stmt = """
-                   SELECT
-                       A.comment_ID+%s as ID,
-                       IF(user_id = 0, comment_author, display_name) as display_name,
-                       IF(user_id = 0, comment_author_email, user_email) as user_email,
-                       CONCAT('Re: ', post_title) as post_title,
-                       UNIX_TIMESTAMP(comment_date_gmt) AS datestamp,
-                       comment_content AS post_content,
-                       IF(comment_parent = 0, comment_post_ID, comment_parent) as post_parent
-                   FROM
-                       wp_comments A LEFT OUTER JOIN
-                       wp_users ON user_id=wp_users.ID,
-                       %s
-                   WHERE
-                       comment_post_ID=wp_posts.ID AND
-                       comment_approved='1' AND
-                       wp_posts.post_type='post' AND wp_posts.post_status='publish' AND
-                   """ % (COMMENT_AHEAD, '%s')
+                    A.post_author=wp_users.ID
+               ) UNION (
+               SELECT
+                   comment_ID AS ID,
+                   IF(user_id = 0, comment_author, display_name) as display_name,
+                   IF(user_id = 0, comment_author_email, user_email) as user_email,
+                   CONCAT('Re: ', post_title) as post_title,
+                   UNIX_TIMESTAMP(comment_date_gmt) AS datestamp,
+                   comment_content AS post_content,
+                   comment_post_ID AS post_parent,
+                   comment_parent
+               FROM
+                   wp_comments A LEFT OUTER JOIN
+                   wp_users ON user_id=wp_users.ID,
+                   wp_posts
+               WHERE
+                   comment_post_ID=wp_posts.ID AND
+                   comment_approved='1' AND
+                   wp_posts.post_type='post' AND wp_posts.post_status='publish'
+               ) ) S, wp_newsgroup_meta M
+               WHERE
+                   M.id=S.ID
+               """.replace('wp_posts', posts_table).replace('wp_comments', comments_table).replace('wp_newsgroup_meta',     meta_table)
         return stmt
 
     def get_NEWGROUPS(self, ts, group='%'):
         return None # TODO
 
     def get_NEWNEWS(self, ts, group='*'):
+        self.update_newsgroup_meta()
         group = 'blog.singpolyma' # TODO
-        table = 'wp_posts' # TODO 
-        articles = []
+        meta_table = self.get_table_name(table_name='newsgroup_meta')
+        posts_table = self.get_table_name(table_name='posts')
+        comments_table = self.get_table_name(table_name='comments')
+        ts = int(time.mktime(ts))
         stmt = """
-                SELECT
-                    ID
+                (SELECT
+                    article_number
                 FROM
-                    %s
+                    wp_posts, wp_newsgroup_meta
                 WHERE
+                    wp_posts.ID=wp_newsgroup_meta.id AND wp_newsgroup_meta.tbl='wp_posts' AND
                     post_type='post' AND post_status='publish' AND
-                    UNIX_TIMESTAMP(datestamp) >= %s""" % (table, ts)
-        num_rows = self.cursor.execute(stmt)
-        ids = list(self.cursor.fetchall())
-        for id in ids:
-            articles.append(self.get_message_id(id, group))
-        if len(articles) == 0:
-            return ''
-        else:
-            return "\r\n".join(articles)
+                    UNIX_TIMESTAMP(post_date_gmt) >= %s
+                ) UNION (
+                SELECT
+                   article_number
+                FROM
+                    wp_comments,
+                    wp_posts,
+                    wp_newsgroup_meta
+                WHERE
+                    comment_ID=wp_newsgroup_meta.id AND wp_newsgroup_meta.tbl='wp_comments' AND
+                    comment_post_ID=wp_posts.ID AND
+                    post_type='post' AND post_status='publish' AND
+                    comment_approved = '1' AND
+                    UNIX_TIMESTAMP(comment_date_gmt) >= %s
+                )
+                ORDER BY
+                    article_number ASC""" % (ts, ts)
+        stmt = stmt.replace('wp_posts', posts_table).replace('wp_comments', comments_table).replace('wp_newsgroup_meta',  meta_table)
+        self.cursor.execute(stmt)
+        result = list(self.cursor.fetchall())
+        return "\r\n".join(["%s" % k for k in result])
 
     def get_GROUP(self, group_name):
         stats = self.get_group_stats(group_name)
@@ -224,126 +257,96 @@ class Papercut_Storage:
         return "\r\n".join(lists)
 
     def get_STAT(self, group_name, id):
-        table_name = self.get_table_name(group_name)
+        meta_table = self.get_table_name(table_name='newsgroup_meta')
         stmt = """
                 SELECT
-                    ID
+                    article_number
                 FROM
                     %s
                 WHERE
-                    post_type='post' AND post_status='publish' AND
-                    ID=%s""" % (table_name, id)
+                    newsgroup='%s' AND
+                    article_number=%s""" % (meta_table, group_name, id)
         return self.cursor.execute(stmt)
 
     def get_ARTICLE(self, group_name, id, headers_only=False, body_only=False):
-        table_name = self.get_table_name(group_name)
-        stmt = self.get_article_sql(id) % (table_name,)
-        cid = self.get_comment_id(id)
-        if cid:
-            stmt += ' A.comment_ID=%s' % (cid,)
+        stmt = self.get_article_sql()
+        if str(id).count('<') > 0 or str(id).count('@') > 0:
+            id = self.quote_string(id)
+            stmt += " AND message_id='%s'" % (id,)
         else:
-            stmt += ' A.ID=%s' % (id,)
+            id = int(id)
+            stmt += " AND article_number=%s" % (id,)
         num_rows = self.cursor.execute(stmt)
         if num_rows == 0:
             return None
         result = list(self.cursor.fetchone())
         if not body_only:
-            if len(result[2]) == 0:
-                author = result[1]
+            if len(result[3]) == 0:
+                author = result[2]
             else:
-                author = "%s <%s>" % (result[1], result[2])
-            formatted_time = strutil.get_formatted_time(time.localtime(result[4]))
+                author = "%s <%s>" % (result[2], result[3])
+            formatted_time = strutil.get_formatted_time(time.localtime(result[5]))
             headers = []
             headers.append("Path: %s" % (settings.nntp_hostname))
             headers.append("From: %s" % (author))
             headers.append("Newsgroups: %s" % (group_name))
             headers.append("Date: %s" % (formatted_time))
-            headers.append("Subject: %s" % (result[3]))
-            headers.append("Message-ID: " + self.get_message_id(result[0], group_name))
+            headers.append("Subject: %s" % (result[4]))
+            headers.append("Message-ID: %s" % (result[9]))
             headers.append("Xref: %s %s:%s" % (settings.nntp_hostname, group_name, result[0]))
-            if result[6] != 0:
-                headers.append("References: " + self.get_message_id(result[6], group_name))
-                headers.append("In-Reply-To: " + self.get_message_id(result[6], group_name))
+            parent = []
+            if result[7] != 0:
+                parent.append(self.get_message_id(result[7], group_name, 'posts'))
+            if result[8] != 0:
+                parent.append(self.get_message_id(result[8], group_name, 'comments'))
+            if len(parent) > 0:
+                headers.append("References: " + ', '.join(parent))
+                headers.append("In-Reply-To: " + parent.pop())
             headers.append('Content-Type: text/plain; charset=utf-8')
         if headers_only:
             return "\r\n".join(headers)
         if html2text:
-            body = html2text.html2text(result[5].encode('utf-8')).encode('utf-8')
+            body = html2text.html2text(result[6].encode('utf-8').replace("\r\n", "\n").replace("\r", "\n").replace("\n\n", "</p><p>")).encode('utf-8')
         else:
-            body = strutil.format_body(result[5].encode('utf-8'))
+            body = strutil.format_body(result[6].encode('utf-8'))
         if body_only:
             return body
-        return ("\r\n".join(headers), body)
+        return ("\r\n".join(headers).encode('utf-8'), body)
 
     def get_LAST(self, group_name, current_id):
-        if int(current_id) > COMMENT_AHEAD:
-            table_name = 'wp_comments' # TODO
-            stmt = """
-                    SELECT
-                        comment_ID+%s as ID
-                    FROM
-                        %s,
-                        wp_posts
-                    WHERE
-                        comment_post_ID=wp_posts.ID AND
-                        post_type='post' AND post_status='publish' AND
-                        comment_approved='1' AND
-                        ID < %s
-                    ORDER BY
-                        ID DESC
-                    LIMIT 0, 1""" % (COMMENT_AHEAD, table_name, self.get_comment_id(current_id))
-        else:
-            table_name = self.get_table_name(group_name)
-            stmt = """
-                    SELECT
-                        ID
-                    FROM
-                        %s
-                    WHERE
-                        post_type='post' AND post_status='publish' AND
-                        ID < %s
-                    ORDER BY
-                        ID DESC
-                    LIMIT 0, 1""" % (table_name, current_id)
+        meta_table = self.get_table_name(table_name='newsgroup_meta')
+        stmt = """
+               SELECT
+                   article_number
+               FROM
+                   %s
+               WHERE
+                   newsgroup='%s' AND article_number < %s
+               ORDER BY
+                   ID DESC
+               LIMIT 0, 1
+               """ % (meta_table, group_name, current_id)
         num_rows = self.cursor.execute(stmt)
         if num_rows == 0:
             return None
         return self.cursor.fetchone()[0]
 
     def get_NEXT(self, group_name, current_id):
-        table_name = self.get_table_name(group_name)
+        meta_table = self.get_table_name(table_name='newsgroup_meta')
         stmt = """
-                SELECT
-                    ID
-                FROM
-                    %s
-                WHERE
-                    post_type='post' AND post_status='publish' AND
-                    ID > %s
-                ORDER BY
-                    ID ASC
-                LIMIT 0, 1""" % (table_name, current_id)
+               SELECT
+                   article_number
+               FROM
+                   %s
+               WHERE
+                   newsgroup='%s' AND article_number > %s
+               ORDER BY
+                   ID ASC
+               LIMIT 0, 1
+               """ % (meta_table, group_name, current_id)
         num_rows = self.cursor.execute(stmt)
-        if num_rows == 0: # If no next post, try next as comment
-            cid = self.get_comment_id(current_id)
-            table_name = 'wp_comments'
-            stmt = """
-                    SELECT
-                        comment_ID+%s as ID
-                    FROM
-                        %s,
-                        wp_posts
-                    WHERE
-                        comment_post_ID=wp_posts.ID AND
-                        post_type='post' AND post_status='publish' AND
-                        comment_approved='1' AND
-                        ID > %s
-                    ORDER BY
-                        ID ASC
-                    LIMIT 0, 1""" % (COMMENT_AHEAD, table_name, cid and cid or 0)
-            num_rows = self.cursor.execute(stmt)
-            if num_rows == 0:
-                return None
+        if num_rows == 0:
+            return None
         return self.cursor.fetchone()[0]
 
     def get_HEAD(self, group_name, id):
@@ -353,48 +356,42 @@ class Papercut_Storage:
         return self.get_ARTICLE(group_name, id, body_only=True)
 
     def get_XOVER(self, group_name, start_id, end_id='ggg'):
-        table_name = self.get_table_name(group_name)
-        # TODO: range that crosses over posts and comments will NOT WORK
-        stmt = self.get_article_sql(start_id) % (table_name,)
-        cid = self.get_comment_id(start_id)
-        if cid:
-            id_field = 'comment_ID'
-            stmt += ' comment_ID >= %s' % (cid,)
-            end_id = self.get_comment_id(end_id)
-        else:
-            id_field = 'ID'
-            stmt += ' A.ID >= %s' % (start_id,)
+        self.update_newsgroup_meta()
+        stmt = self.get_article_sql()
+        stmt += " AND article_number >= %s" % (start_id,)
         if end_id != 'ggg':
-            stmt = "%s AND A.%s <= %s" % (stmt, id_field, end_id)
+            stmt += " AND article_number <= %s" % (end_id,)
         self.cursor.execute(stmt)
         result = list(self.cursor.fetchall())
         overviews = []
         for row in result:
             if html2text:
-                body = html2text.html2text(row[5].encode('utf-8')).encode('utf-8')
+                body = html2text.html2text(row[6].encode('utf-8')).encode('utf-8')
             else:
-                body = strutil.format_body(row[5].encode('utf-8'))
-            if row[2] == '':
-                author = row[1]
+                body = strutil.format_body(row[6].encode('utf-8'))
+            if row[3] == '':
+                author = row[2]
             else:
-                author = "%s <%s>" % (row[1], row[2])
-            formatted_time = strutil.get_formatted_time(time.localtime(row[4]))
-            message_id = self.get_message_id(row[0], group_name)
+                author = "%s <%s>" % (row[2], row[3])
+            formatted_time = strutil.get_formatted_time(time.localtime(row[5]))
+            message_id = row[9]
             line_count = body.count("\n")
             xref = 'Xref: %s %s:%s' % (settings.nntp_hostname, group_name, row[0])
-            if row[6] != 0:
-                reference = self.get_message_id(row[6], group_name)
-            else:
-                reference = ""
+            parent = []
+            if row[7] != 0:
+                parent.append(self.get_message_id(row[7], group_name, 'posts'))
+            if row[8] != 0:
+                parent.append(self.get_message_id(row[8], group_name, 'comments'))
+            reference = ', '.join(parent)
             # message_number <tab> subject <tab> author <tab> date <tab> message_id <tab> reference <tab> bytes <tab> lines <tab> xref
-            overviews.append("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (row[0], row[3], author, formatted_time, message_id, reference, len(body), line_count, xref))
+            overviews.append("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (row[0], row[4], author, formatted_time, message_id, reference, len(body), line_count, xref))
         return "\r\n".join(overviews)
 
     def get_XPAT(self, group_name, header, pattern, start_id, end_id='ggg'):
+        return None # TODO: really broken
         # XXX: need to actually check for the header values being passed as
         # XXX: not all header names map to column names on the tables
         table_name = self.get_table_name(group_name)
-        # TODO: support comments as well
         stmt = """
                 SELECT
                     A.ID,
@@ -443,27 +440,16 @@ class Papercut_Storage:
             return "\r\n".join(hdrs)
 
     def get_LISTGROUP(self, group_name):
-        table_name = self.get_table_name(group_name)
+        self.update_newsgroup_meta()
+        meta_table = self.get_table_name(table_name='newsgroup_meta')
         stmt = """
-                (SELECT
-                    ID
-                FROM
-                    %s
-                WHERE
-                    post_type='post' AND post_status='publish'
-                ) UNION (
-                SELECT
-                    comment_ID+%s as ID
-                FROM
-                    wp_comments,
-                    wp_posts
-                WHERE
-                    comment_post_ID=wp_posts.ID AND
-                    post_type='post' AND post_status='publish' AND
-                    comment_approved = '1'
-                )
-                ORDER BY
-                    ID ASC""" % (table_name, COMMENT_AHEAD)
+               SELECT
+                   article_number
+               FROM
+                   %s
+               WHERE
+                   newsgroup='%s'
+               """ % (meta_table, group_name)
         self.cursor.execute(stmt)
         result = list(self.cursor.fetchall())
         return "\r\n".join(["%s" % k for k in result])
@@ -472,26 +458,25 @@ class Papercut_Storage:
         return "blog.singpolyma Singpolyma" # TODO
 
     def get_XHDR(self, group_name, header, style, range):
-        table_name = self.get_table_name(group_name)
-        # TODO: range that crosses over posts and comments will NOT WORK
-        stmt = self.get_article_sql(range[0]) % (table_name,)
-        id_field = 'ID'
-        cid = self.get_comment_id(range[0])
-        if cid:
-            id_field = 'comment_ID'
+        self.update_newsgroup_meta()
+        stmt = self.get_article_sql()
+
         if style == 'range':
-            stmt = '%s A.%s >= %s' % (stmt, id_field, cid and cid or range[0])
+            stmt += ' AND article_number >= %s' % (range[0],)
             if len(range) == 2:
-                stmt = '%s AND A.%s <= %s' % (stmt, id_field, cid and range[1]-COMMENT_AHEAD or range[1])
+                stmt += ' AND article_number <= %s' % (range[1])
         else:
-            stmt = '%s A.%s = %s' % (stmt, id_field, cid and cid or range[0])
+            stmt += ' AND article_number = %s' % (range[0],)
         if self.cursor.execute(stmt) == 0:
             return None
         result = self.cursor.fetchall()
         hdrs = []
         for row in result:
-            row = list(row)
-            row.insert(0, row.pop()) # Shove post_parent on the front
+            parent = []
+            if row[7] != 0:
+                parent.append(self.get_message_id(row[7], group_name, 'posts'))
+            if row[8] != 0:
+                parent.append(self.get_message_id(row[8], group_name, 'comments'))
             if header.upper() == 'SUBJECT':
                 hdrs.append('%s %s' % (row[0], row[4]))
             elif header.upper() == 'FROM':
@@ -499,9 +484,9 @@ class Papercut_Storage:
             elif header.upper() == 'DATE':
                 hdrs.append('%s %s' % (row[0], strutil.get_formatted_time(time.localtime(result[5]))))
             elif header.upper() == 'MESSAGE-ID':
-                hdrs.append(row[0] + ' ' + self.get_message_id(row[0], group_name))
-            elif (header.upper() == 'REFERENCES') and (row[1] != 0):
-                hdrs.append(row[0] + ' ' + self.get_message_id(row[1], group_name))
+                hdrs.append(row[0] + ' ' + row[9])
+            elif (header.upper() == 'REFERENCES') and len(parent) > 0:
+                hdrs.append('%s %s' % (row[0], ', '.join(parent)))
             elif header.upper() == 'BYTES':
                 hdrs.append('%s %s' % (row[0], len(row[6])))
             elif header.upper() == 'LINES':
